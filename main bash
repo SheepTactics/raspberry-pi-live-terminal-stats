@@ -42,18 +42,18 @@ while true; do
   read r_sectors w_sectors <<< $disk_line
   delta_r=$(($r_sectors - $prev_r_sectors))
   delta_w=$(($w_sectors - $prev_w_sectors))
-  # READ: Convert to FB (full bytes) if over 999 KB, else KB, always 3 digits
+  # READ: Convert to MB if over 999 KB, else KB, always 3 digits
   if [ $delta_r -gt 1998 ]; then
     read_val=$(echo "scale=0; $delta_r / 2048" | bc)
-    read_unit="FB/s"
+    read_unit="MB/s"
   else
     read_val=$(echo "scale=0; $delta_r / 2" | bc)
     read_unit="KB/s"
   fi
-  # WRITE: Convert to FB if over 999 KB, else KB, always 3 digits
+  # WRITE: Convert to MB if over 999 KB, else KB, always 3 digits
   if [ $delta_w -gt 1998 ]; then
     write_val=$(echo "scale=0; $delta_w / 2048" | bc)
-    write_unit="FB/s"
+    write_unit="MB/s"
   else
     write_val=$(echo "scale=0; $delta_w / 2" | bc)
     write_unit="KB/s"
