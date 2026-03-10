@@ -1,24 +1,46 @@
 #!/bin/bash
 
-# CPU Temp Initial
-temp_val=$(cat /sys/class/thermal/thermal_zone0/temp)
-temp=$(echo "scale=1; $temp_val / 1000" | bc)
 # CPU Usage Initial
+
 cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
-read user nice system idle iowait irq softirq steal guest guest_nice <<< $cpu_line
+read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
 prev_total=$(($user + $nice + $system + $idle + $iowait + $irq + $softirq + $steal + $guest + $guest_nice))
 prev_idletot=$(($idle + $iowait))
-# Disk IO Initial
-disk_line=$(awk '/mmcblk0 / {print $6, $10}' /proc/diskstats)
-read prev_r_sectors prev_w_sectors <<< $disk_line
 
+# Disk IO Initial
+
+disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
+read -r prev_r_sectors prev_w_sectors <<< "$disk_line"
+
+# Network IO Initial
+
+net_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+[ -z "$net_iface" ] && net_iface=$(ls /sys/class/net | grep -v lo | head -1)
+net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
+read -r prev_rx_bytes prev_tx_bytes <<< "$net_line"
+
+# Clear entire screen once at first run
+
+printf '\033[2J\033[H'
+
+# Align first delta window
+
+sleep 1
 while true; do
+
   # CPU Temp
-  temp_val=$(cat /sys/class/thermal/thermal_zone0/temp)
-  temp=$(echo "scale=1; $temp_val / 1000" | bc)
+
+  if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+    temp_val=$(cat /sys/class/thermal/thermal_zone0/temp)
+    temp=$(echo "scale=1; $temp_val / 1000" | bc)
+  else
+    temp="N/A"
+  fi
+
   # CPU Usage
+
   cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
-  read user nice system idle iowait irq softirq steal guest guest_nice <<< $cpu_line
+  read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
   total=$(($user + $nice + $system + $idle + $iowait + $irq + $softirq + $steal + $guest + $guest_nice))
   idletot=$(($idle + $iowait))
   delta_total=$(($total - $prev_total))
@@ -28,21 +50,32 @@ while true; do
   else
     cpu_perc=0.0
   fi
-  # Format CPU percentage with leading zero if below 10
   cpu_perc=$(printf "%04.1f" "$cpu_perc")
+
   # RAM Usage
+
   mem_line=$(awk '/MemTotal/ {tot=$2} /MemAvailable/ {avail=$2} END {print tot, avail}' /proc/meminfo)
-  read mem_total mem_avail <<< $mem_line
+  read -r mem_total mem_avail <<< "$mem_line"
   used=$(($mem_total - $mem_avail))
   ram_perc=$(echo "scale=1; $used * 100 / $mem_total" | bc)
-  # Format RAM percentage with leading zero if below 10
   ram_perc=$(printf "%04.1f" "$ram_perc")
+
   # Disk IO
-  disk_line=$(awk '/mmcblk0 / {print $6, $10}' /proc/diskstats)
-  read r_sectors w_sectors <<< $disk_line
-  delta_r=$(($r_sectors - $prev_r_sectors))
-  delta_w=$(($w_sectors - $prev_w_sectors))
+
+  disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
+  if [ -n "$disk_line" ]; then
+    read -r r_sectors w_sectors <<< "$disk_line"
+    delta_r=$(($r_sectors - $prev_r_sectors))
+    delta_w=$(($w_sectors - $prev_w_sectors))
+  else
+    delta_r=0
+    delta_w=0
+    r_sectors=${prev_r_sectors:-0}
+    w_sectors=${prev_w_sectors:-0}
+  fi
+
   # READ: Convert to MB if over 999 KB, else KB, always 3 digits
+
   if [ $delta_r -gt 1998 ]; then
     read_val=$(echo "scale=0; $delta_r / 2048" | bc)
     read_unit="MB/s"
@@ -50,7 +83,9 @@ while true; do
     read_val=$(echo "scale=0; $delta_r / 2" | bc)
     read_unit="KB/s"
   fi
+
   # WRITE: Convert to MB if over 999 KB, else KB, always 3 digits
+
   if [ $delta_w -gt 1998 ]; then
     write_val=$(echo "scale=0; $delta_w / 2048" | bc)
     write_unit="MB/s"
@@ -58,14 +93,56 @@ while true; do
     write_val=$(echo "scale=0; $delta_w / 2" | bc)
     write_unit="KB/s"
   fi
-  read_val=$(printf "%03d" $read_val)
-  write_val=$(printf "%03d" $write_val)
+  read_val=$(printf "%03d" "$read_val")
+  write_val=$(printf "%03d" "$write_val")
+
+  # Network IO
+
+  net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
+  if [ -n "$net_line" ]; then
+    read -r rx_bytes tx_bytes <<< "$net_line"
+    delta_rx=$(($rx_bytes - $prev_rx_bytes))
+    delta_tx=$(($tx_bytes - $prev_tx_bytes))
+  else
+    delta_rx=0
+    delta_tx=0
+    rx_bytes=${prev_rx_bytes:-0}
+    tx_bytes=${prev_tx_bytes:-0}
+  fi
+
+  # DOWN: Convert to MB if over 999 KB, else KB, always 3 digits
+
+  if [ $delta_rx -gt 1048575 ]; then
+    down_val=$(echo "scale=0; $delta_rx / 1048576" | bc)
+    down_unit="MB/s"
+  else
+    down_val=$(echo "scale=0; $delta_rx / 1024" | bc)
+    down_unit="KB/s"
+  fi
+
+  # UP: Convert to MB if over 999 KB, else KB, always 3 digits
+
+  if [ $delta_tx -gt 1048575 ]; then
+    up_val=$(echo "scale=0; $delta_tx / 1048576" | bc)
+    up_unit="MB/s"
+  else
+    up_val=$(echo "scale=0; $delta_tx / 1024" | bc)
+    up_unit="KB/s"
+  fi
+  down_val=$(printf "%03d" "$down_val")
+  up_val=$(printf "%03d" "$up_val")
+
   # Format output
-  printf -v data "TMP:%.1fC|CPU:%s%%|RAM:%s%%|R:%s%s|W:%s%s" "$temp" "$cpu_perc" "$ram_perc" "$read_val" "$read_unit" "$write_val" "$write_unit"
+
+  printf -v data "TMP:%.1fC|CPU:%s%%|RAM:%s%%|R:%s%s|W:%s%s|D:%s%s|U:%s%s" \
+    "$temp" "$cpu_perc" "$ram_perc" "$read_val" "$read_unit" "$write_val" "$write_unit" \
+    "$down_val" "$down_unit" "$up_val" "$up_unit"
   echo -ne "\033[s\033[1;1H\033[K$data\033[u"
   prev_total=$total
   prev_idletot=$idletot
   prev_r_sectors=$r_sectors
   prev_w_sectors=$w_sectors
+  prev_rx_bytes=$rx_bytes
+  prev_tx_bytes=$tx_bytes
   sleep 1
 done
