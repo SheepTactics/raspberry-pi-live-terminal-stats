@@ -1,148 +1,140 @@
+#!/usr/bin/env bash
+# === SysMon Installer + Monitor Script ===
+# Description: installs a lightweight terminal system monitor to $HOME/.local/bin
+# and creates a Desktop launcher. The running monitor prints compact stats
+# with numeric fields rendered bold using ANSI escape codes.
+
+bash << 'INSTALL'
+SCRIPT_DIR="$HOME/.local/bin"
+SCRIPT_PATH="$SCRIPT_DIR/sysmon.sh"
+DESKTOP_FILE="$HOME/Desktop/SysMon.desktop"
+mkdir -p "$SCRIPT_DIR" "$HOME/Desktop"
+
+# === Create monitor script file ===
+cat > "$SCRIPT_PATH" << 'MONITOR_EOF'
 #!/bin/bash
-
-# CPU Usage Initial
-
+# === Initial CPU snapshot ===
 cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
 read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
-prev_total=$(($user + $nice + $system + $idle + $iowait + $irq + $softirq + $steal + $guest + $guest_nice))
-prev_idletot=$(($idle + $iowait))
+prev_total=$(($user+$nice+$system+$idle+$iowait+$irq+$softirq+$steal+$guest+$guest_nice))
+prev_idletot=$(($idle+$iowait))
 
-# Disk IO Initial
-
+# === Initial disk snapshot (mmcblk0) ===
 disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
 read -r prev_r_sectors prev_w_sectors <<< "$disk_line"
 
-# Network IO Initial
-
+# === Determine network interface and initial snapshot ===
 net_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
 [ -z "$net_iface" ] && net_iface=$(ls /sys/class/net | grep -v lo | head -1)
 net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
 read -r prev_rx_bytes prev_tx_bytes <<< "$net_line"
 
-# Clear entire screen once at first run
-
+# === Prepare terminal ===
 printf '\033[2J\033[H'
-
-# Align first delta window
-
 sleep 1
+
+# === Main loop: sample and display every second ===
 while true; do
-
-  # CPU Temp
-
+  # --- Temperature reading (if available)
   if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
-    temp_val=$(cat /sys/class/thermal/thermal_zone0/temp)
-    temp=$(echo "scale=1; $temp_val / 1000" | bc)
+    temp=$(echo "scale=1; $(cat /sys/class/thermal/thermal_zone0/temp) / 1000" | bc)
   else
     temp="N/A"
   fi
 
-  # CPU Usage
-
+  # --- CPU usage calculation
   cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
   read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
-  total=$(($user + $nice + $system + $idle + $iowait + $irq + $softirq + $steal + $guest + $guest_nice))
-  idletot=$(($idle + $iowait))
-  delta_total=$(($total - $prev_total))
-  delta_idle=$(($idletot - $prev_idletot))
-  if [ $delta_total -gt 0 ]; then
-    cpu_perc=$(echo "scale=1; 100 * ($delta_total - $delta_idle) / $delta_total" | bc)
-  else
-    cpu_perc=0.0
-  fi
+  total=$(($user+$nice+$system+$idle+$iowait+$irq+$softirq+$steal+$guest+$guest_nice))
+  idletot=$(($idle+$iowait))
+  delta_total=$(($total-$prev_total)); delta_idle=$(($idletot-$prev_idletot))
+  [ $delta_total -gt 0 ] && cpu_perc=$(echo "scale=1; 100*($delta_total-$delta_idle)/$delta_total" | bc) || cpu_perc=0.0
   cpu_perc=$(printf "%04.1f" "$cpu_perc")
 
-  # RAM Usage
-
-  mem_line=$(awk '/MemTotal/ {tot=$2} /MemAvailable/ {avail=$2} END {print tot, avail}' /proc/meminfo)
+  # --- Memory usage calculation
+  mem_line=$(awk '/MemTotal/{tot=$2}/MemAvailable/{avail=$2}END{print tot,avail}' /proc/meminfo)
   read -r mem_total mem_avail <<< "$mem_line"
-  used=$(($mem_total - $mem_avail))
-  ram_perc=$(echo "scale=1; $used * 100 / $mem_total" | bc)
-  ram_perc=$(printf "%04.1f" "$ram_perc")
+  ram_perc=$(printf "%04.1f" "$(echo "scale=1; ($mem_total-$mem_avail)*100/$mem_total" | bc)")
 
-  # Disk IO
+  # --- Power reading (vcgencmd) — best-effort
+  pwr_raw=$(vcgencmd pmic_read_adc EXT5V_V 2>/dev/null)
+  pwr=$(echo "$pwr_raw" | grep -oP '=\K[0-9]+\.[0-9]+' | cut -c1-4)
+  [ -z "$pwr" ] && pwr="N/A"
 
+  # --- Disk I/O delta calculation (reads/writes since last sample)
   disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
   if [ -n "$disk_line" ]; then
     read -r r_sectors w_sectors <<< "$disk_line"
-    delta_r=$(($r_sectors - $prev_r_sectors))
-    delta_w=$(($w_sectors - $prev_w_sectors))
+    delta_r=$(($r_sectors-$prev_r_sectors)); delta_w=$(($w_sectors-$prev_w_sectors))
   else
-    delta_r=0
-    delta_w=0
-    r_sectors=${prev_r_sectors:-0}
-    w_sectors=${prev_w_sectors:-0}
+    delta_r=0; delta_w=0; r_sectors=${prev_r_sectors:-0}; w_sectors=${prev_w_sectors:-0}
   fi
+  [ $delta_r -gt 1998 ] && read_val=$(echo "scale=0;$delta_r/2048"|bc) && read_unit="MB/s" || { read_val=$(echo "scale=0;$delta_r/2"|bc); read_unit="KB/s"; }
+  [ $delta_w -gt 1998 ] && write_val=$(echo "scale=0;$delta_w/2048"|bc) && write_unit="MB/s" || { write_val=$(echo "scale=0;$delta_w/2"|bc); write_unit="KB/s"; }
+  read_val=$(printf "%03d" "$read_val"); write_val=$(printf "%03d" "$write_val")
 
-  # READ: Convert to MB if over 999 KB, else KB, always 3 digits
-
-  if [ $delta_r -gt 1998 ]; then
-    read_val=$(echo "scale=0; $delta_r / 2048" | bc)
-    read_unit="MB/s"
-  else
-    read_val=$(echo "scale=0; $delta_r / 2" | bc)
-    read_unit="KB/s"
-  fi
-
-  # WRITE: Convert to MB if over 999 KB, else KB, always 3 digits
-
-  if [ $delta_w -gt 1998 ]; then
-    write_val=$(echo "scale=0; $delta_w / 2048" | bc)
-    write_unit="MB/s"
-  else
-    write_val=$(echo "scale=0; $delta_w / 2" | bc)
-    write_unit="KB/s"
-  fi
-  read_val=$(printf "%03d" "$read_val")
-  write_val=$(printf "%03d" "$write_val")
-
-  # Network IO
-
+  # --- Network I/O delta calculation (rx/tx since last sample)
   net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
   if [ -n "$net_line" ]; then
     read -r rx_bytes tx_bytes <<< "$net_line"
-    delta_rx=$(($rx_bytes - $prev_rx_bytes))
-    delta_tx=$(($tx_bytes - $prev_tx_bytes))
+    delta_rx=$(($rx_bytes-$prev_rx_bytes)); delta_tx=$(($tx_bytes-$prev_tx_bytes))
   else
-    delta_rx=0
-    delta_tx=0
-    rx_bytes=${prev_rx_bytes:-0}
-    tx_bytes=${prev_tx_bytes:-0}
+    delta_rx=0; delta_tx=0; rx_bytes=${prev_rx_bytes:-0}; tx_bytes=${prev_tx_bytes:-0}
   fi
+  [ $delta_rx -gt 1048575 ] && in_val=$(echo "scale=0;$delta_rx/1048576"|bc) && in_unit="MB/s" || { in_val=$(echo "scale=0;$delta_rx/1024"|bc); in_unit="KB/s"; }
+  [ $delta_tx -gt 1048575 ] && out_val=$(echo "scale=0;$delta_tx/1048576"|bc) && out_unit="MB/s" || { out_val=$(echo "scale=0;$delta_tx/1024"|bc); out_unit="KB/s"; }
+  in_val=$(printf "%03d" "$in_val"); out_val=$(printf "%03d" "$out_val")
 
-  # DOWN: Convert to MB if over 999 KB, else KB, always 3 digits
+  # --- Format output: numeric fields wrapped in ANSI bold codes
+  printf -v data "TMP:\033[1m%.1f\033[0mC|CPU:\033[1m%s\033[0m%%|RAM:\033[1m%s\033[0m%%|PWR:\033[1m%s\033[0mV|R:\033[1m%s\033[0m%s|W:\033[1m%s\033[0m%s|I:\033[1m%s\033[0m%s|O:\033[1m%s\033[0m%s" \
+    "$temp" "$cpu_perc" "$ram_perc" "$pwr" "$read_val" "$read_unit" "$write_val" "$write_unit" "$in_val" "$in_unit" "$out_val" "$out_unit"
 
-  if [ $delta_rx -gt 1048575 ]; then
-    down_val=$(echo "scale=0; $delta_rx / 1048576" | bc)
-    down_unit="MB/s"
-  else
-    down_val=$(echo "scale=0; $delta_rx / 1024" | bc)
-    down_unit="KB/s"
-  fi
-
-  # UP: Convert to MB if over 999 KB, else KB, always 3 digits
-
-  if [ $delta_tx -gt 1048575 ]; then
-    up_val=$(echo "scale=0; $delta_tx / 1048576" | bc)
-    up_unit="MB/s"
-  else
-    up_val=$(echo "scale=0; $delta_tx / 1024" | bc)
-    up_unit="KB/s"
-  fi
-  down_val=$(printf "%03d" "$down_val")
-  up_val=$(printf "%03d" "$up_val")
-
-  # Format output
-
-  printf -v data "TMP:%.1fC|CPU:%s%%|RAM:%s%%|R:%s%s|W:%s%s|D:%s%s|U:%s%s" \
-    "$temp" "$cpu_perc" "$ram_perc" "$read_val" "$read_unit" "$write_val" "$write_unit" \
-    "$down_val" "$down_unit" "$up_val" "$up_unit"
+  # --- Display and cursor handling (keep one-line overlay)
   echo -ne "\033[s\033[1;1H\033[K$data\033[u"
-  prev_total=$total
-  prev_idletot=$idletot
-  prev_r_sectors=$r_sectors
-  prev_w_sectors=$w_sectors
-  prev_rx_bytes=$rx_bytes
-  prev_tx_bytes=$tx_bytes
+
+  # --- Update previous-sample variables
+  prev_total=$total; prev_idletot=$idletot; prev_r_sectors=$r_sectors
+  prev_w_sectors=$w_sectors; prev_rx_bytes=$rx_bytes; prev_tx_bytes=$tx_bytes
+
+  # --- Sleep until next sample
   sleep 1
 done
+MONITOR_EOF
+
+# === Make the monitor script executable ===
+chmod +x "$SCRIPT_PATH"
+
+# === Detect available terminal emulator for launcher ===
+for term in gnome-terminal xfce4-terminal lxterminal mate-terminal konsole xterm alacritty kitty; do
+  command -v "$term" &>/dev/null && TERM_BIN="$term" && break
+done
+
+# === Build Exec command for Desktop file ===
+case "$TERM_BIN" in
+  gnome-terminal)  EXEC="gnome-terminal -- bash -c '$SCRIPT_PATH; exec bash'" ;;
+  xfce4-terminal)  EXEC="xfce4-terminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
+  mate-terminal)   EXEC="mate-terminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
+  lxterminal)      EXEC="lxterminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
+  konsole)         EXEC="konsole -e bash -c '$SCRIPT_PATH; exec bash'" ;;
+  *)               EXEC="${TERM_BIN:-xterm} -e bash -c '$SCRIPT_PATH; exec bash'" ;;
+esac
+
+# === Create Desktop launcher file ===
+cat > "$DESKTOP_FILE" << DESKTOP_EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SysMon
+Comment=System Monitor
+Exec=$EXEC
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+DESKTOP_EOF
+
+# === Finalize launcher and run monitor ===
+chmod +x "$DESKTOP_FILE"
+command -v gio &>/dev/null && gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null
+
+exec bash "$SCRIPT_PATH"
+INSTALL
